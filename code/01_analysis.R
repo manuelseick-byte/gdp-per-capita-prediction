@@ -398,3 +398,203 @@ income_base <- income_base %>%
     )
   )
 
+income_groups <- income_base %>%
+  select(
+    Country.Code, Country.Name,
+    income_pc_for_class,
+    gni_pc_2023, gdp_pc_2023, gni_pc_last, year_last_gni,
+    income_group_4, income_group_3
+  )
+
+# 4.5 Merge classification back into country panel ----------------------------
+
+macro_countries_only <- macro_countries_only %>%
+  left_join(income_groups, by = c("Country.Code", "Country.Name"))
+
+write.csv(income_groups, "income_groups.csv", row.names = FALSE)
+
+# Countries classified as low income due to missing data
+low_income_no_data <- income_groups %>%
+  filter(
+    income_group_3 == "Low income",
+    is.na(gni_pc_2023),
+    is.na(gdp_pc_2023),
+    is.na(gni_pc_last)
+  ) %>%
+  select(Country.Code, Country.Name)
+
+# Population by income group (3-group) in 2023
+pop_by_income_3 <- macro_countries_only %>%
+  filter(year == 2023) %>%
+  group_by(income_group_3) %>%
+  summarise(
+    world_pop       = sum(population, na.rm = TRUE),
+    world_pop_share = world_pop / sum(world_pop),
+    .groups         = "drop"
+  )
+
+# Number of countries per income group (3-group)
+countries_by_income_3 <- macro_countries_only %>%
+  filter(year == 2023) %>%
+  distinct(Country.Code, income_group_3) %>%
+  count(income_group_3, name = "n_countries")
+
+###############################################################################
+################# (5) DATA CLEANING & FEATURE ENGINEERING #####################
+###############################################################################
+
+## 5.1 Restrict to 1990–2023 and basic filters --------------------------------
+
+macro <- macro_countries_only %>%
+  filter(year >= 1990, year <= 2023) %>%
+  filter(population > 0, gdp_const_usd > 0)
+
+## 5.2 Solow feature engineering ----------------------------------------------
+
+macro_fe <- macro %>%
+  arrange(Country.Code, year) %>%
+  group_by(Country.Code) %>%
+  mutate(
+    gdp_pc = gdp_const_usd / population,
+    gni_pc = gni_const_usd / population,
+    log_gdp_pc = log(gdp_pc),
+    savings_rate     = gross_savings_current_usd / gdp_const_usd,
+    net_income_share = net_primary_income_current_usd / gdp_const_usd,
+    labour_participation = labour_force / population,
+    pop_growth = (population - lag(population)) / lag(population),
+    log_hc = ifelse(human_capital_index > 0, log(human_capital_index), NA_real_),
+    log_A_t = ifelse(A_t > 0, log(A_t), NA_real_)
+  ) %>%
+  ungroup()
+
+solow_vars <- c(
+  "log_gdp_pc", "savings_rate", "pop_growth",
+  "log_hc", "log_A_t", "labour_participation", "net_income_share"
+)
+
+## 5.3 Country completeness (25% rule) + build macro_model with lags ----------
+
+country_completeness_solow <- macro_fe %>%
+  group_by(Country.Code, Country.Name) %>%
+  summarise(
+    completeness = 1 - mean(is.na(pick(all_of(solow_vars)))),
+    .groups      = "drop"
+  )
+
+keep_countries <- country_completeness_solow %>%
+  filter(completeness >= 0.25) %>%
+  pull(Country.Code)
+
+macro_model <- macro_fe %>%
+  filter(
+    Country.Code %in% keep_countries,
+    !is.na(log_gdp_pc),
+    !is.na(savings_rate),
+    !is.na(pop_growth),
+    !is.na(log_hc),
+    !is.na(log_A_t)
+  ) %>%
+  arrange(Country.Code, year) %>%
+  group_by(Country.Code) %>%
+  # 10 lags of log GDP per capita (panel-consistent)
+  mutate(
+    across(
+      log_gdp_pc,
+      list(
+        lag_1  = ~ lag(.x, 1),
+        lag_2  = ~ lag(.x, 2),
+        lag_3  = ~ lag(.x, 3),
+        lag_4  = ~ lag(.x, 4),
+        lag_5  = ~ lag(.x, 5),
+        lag_6  = ~ lag(.x, 6),
+        lag_7  = ~ lag(.x, 7),
+        lag_8  = ~ lag(.x, 8),
+        lag_9  = ~ lag(.x, 9),
+        lag_10 = ~ lag(.x, 10)
+      ),
+      .names = "{.fn}"
+    )
+  ) %>%
+  ungroup()
+
+## 5.4 Extra feature engineering (interactions, nonlinear terms) --------------
+
+# Interaction terms
+macro_model$hc_x_tfp   <- macro_model$log_hc * macro_model$log_A_t
+macro_model$save_x_pop <- macro_model$savings_rate * macro_model$pop_growth
+
+# Quadratic terms
+macro_model$save2 <- macro_model$savings_rate^2
+macro_model$pop2  <- macro_model$pop_growth^2
+macro_model$hc2   <- macro_model$log_hc^2
+macro_model$tfp2  <- macro_model$log_A_t^2
+
+# Income group interactions (using 3-group classification)
+macro_model$middle_x_tfp <- ifelse(macro_model$income_group_3 == "Middle income", 1, 0) * macro_model$log_A_t
+macro_model$high_x_hc    <- ifelse(macro_model$income_group_3 == "High income", 1, 0) * macro_model$log_hc
+
+## 5.5 Autoregressive Solow model with 20 lags (extension) ---------------------
+
+macro_ar <- macro_model %>%
+  arrange(Country.Code, year) %>%
+  group_by(Country.Code)
+
+for (k in 1:20) {
+  macro_ar <- macro_ar %>%
+    mutate(!!paste0("log_gdp_pc_lag", k) := lag(log_gdp_pc, k))
+}
+
+macro_ar <- macro_ar %>% ungroup()
+
+macro_ar20 <- macro_ar %>%
+  filter(!is.na(log_gdp_pc_lag20))
+
+lag_terms <- paste0("log_gdp_pc_lag", 1:20, collapse = " + ")
+
+solow_terms <- paste(
+  "savings_rate",
+  "pop_growth",
+  "log_hc",
+  "log_A_t",
+  "labour_participation",
+  "net_income_share",
+  sep = " + "
+)
+
+full_formula <- as.formula(
+  paste("log_gdp_pc ~", lag_terms, "+", solow_terms)
+)
+
+solow_ar20 <- lm(full_formula, data = macro_ar20)
+num_regressors <- length(coef(solow_ar20)) - 1
+
+###############################################################################
+################# (6) VISUALISATION OF ENGINEERED DATA ########################
+###############################################################################
+
+# 6.1 Correlation heatmap (Solow vars) ----------------------------------------
+
+corr_matrix <- macro_model %>%
+  select(all_of(solow_vars)) %>%
+  cor(use = "pairwise.complete.obs")
+
+melted_corr <- melt(corr_matrix)
+
+ggplot(melted_corr, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), color = "white") +
+  scale_fill_gradient2(
+    low = "#B2182B", high = "#2166AC", mid = "white",
+    midpoint = 0, limit = c(-1, 1), space = "Lab"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "", y = "")
+
+# 6.2 Distributions of key variables ------------------------------------------
+
+ggplot(macro_model, aes(log_gdp_pc)) +
+  geom_histogram(fill = "#2C3E50", bins = 40, color = "white") +
+  labs(x = "log(GDP per capita)", y = "Count") +
+  theme_minimal(base_size = 14)
+
