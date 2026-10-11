@@ -598,3 +598,203 @@ ggplot(macro_model, aes(log_gdp_pc)) +
   labs(x = "log(GDP per capita)", y = "Count") +
   theme_minimal(base_size = 14)
 
+ggplot(macro_model, aes(log_hc)) +
+  geom_histogram(fill = "#4E79A7", bins = 40, color = "white") +
+  labs(x = "log(HCI)", y = "Count") +
+  theme_minimal(base_size = 14)
+
+ggplot(macro_model, aes(log_A_t)) +
+  geom_histogram(fill = "#F28E2B", bins = 40, color = "white") +
+  labs(x = "log(A_t)", y = "Count") +
+  theme_minimal(base_size = 14)
+
+ggplot(macro_model, aes(savings_rate)) +
+  geom_histogram(fill = "#E15759", bins = 40, color = "white") +
+  labs(x = "Savings rate (Gross savings / GDP)", y = "Count") +
+  theme_minimal(base_size = 14)
+
+# 6.3 Scatterplots vs log GDP per capita --------------------------------------
+
+ggplot(macro_model, aes(savings_rate, log_gdp_pc)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(x = "Savings rate", y = "log(GDP per capita)") +
+  theme_minimal(base_size = 14)
+
+ggplot(macro_model, aes(log_hc, log_gdp_pc)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(x = "log(HCI)", y = "log(GDP per capita)") +
+  theme_minimal(base_size = 14)
+
+ggplot(macro_model, aes(log_A_t, log_gdp_pc)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  labs(x = "log(A_t)", y = "log(GDP per capita)") +
+  theme_minimal(base_size = 14)
+
+# 6.4 Distributions by income group -------------------------------------------
+
+ggplot(macro_model, aes(x = income_group_3, y = log_gdp_pc)) +
+  geom_boxplot(fill = "#1B9E77") +
+  labs(x = "Income group", y = "log(GDP per capita)") +
+  theme_minimal(base_size = 14)
+
+ggplot(macro_model, aes(x = income_group_3, y = human_capital_index)) +
+  geom_boxplot(fill = "#D95F02") +
+  labs(x = "Income group", y = "Human Capital Index") +
+  theme_minimal(base_size = 14)
+
+###############################################################################
+################# (7) BASELINE DATA + TRAIN/TEST SPLIT ########################
+###############################################################################
+
+solow_vars_base <- c(
+  "savings_rate",
+  "pop_growth",
+  "log_hc",
+  "log_A_t",
+  "labour_participation",
+  "net_income_share"
+)
+
+model_data_base <- macro_model %>%
+  select(log_gdp_pc, all_of(solow_vars_base)) %>%
+  drop_na()
+
+set.seed(123)
+n_base <- nrow(model_data_base)
+train_idx_base <- sample(1:n_base, size = round(0.7 * n_base))
+
+train_base <- model_data_base[train_idx_base, ]
+test_base  <- model_data_base[-train_idx_base, ]
+
+###############################################################################
+################# (8) BASELINE SOLOW REGRESSION ###############################
+###############################################################################
+
+solow_baseline <- lm(
+  log_gdp_pc ~ savings_rate + pop_growth + log_hc + log_A_t,
+  data = train_base
+)
+
+summary(solow_baseline)
+
+# Test RMSE (OLS baseline)
+test_base$pred_ols <- predict(solow_baseline, newdata = test_base)
+rmse_ols <- sqrt(mean((test_base$log_gdp_pc - test_base$pred_ols)^2))
+
+# Actual vs. predicted (on test set)
+ggplot(test_base, aes(x = log_gdp_pc, y = pred_ols)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(
+    x = "Actual log(GDP per capita)",
+    y = "Predicted log(GDP per capita)"
+  ) +
+  theme_minimal(base_size = 14)
+
+# LaTeX regression table
+stargazer(
+  solow_baseline,
+  type = "latex",
+  title = "Baseline Solow Regression",
+  dep.var.labels = "log GDP per capita",
+  covariate.labels = c("Savings rate", "Population growth",
+                       "log(Human capital)", "log(TFP)"),
+  digits = 3
+)
+
+# Diagnostic plots
+par(mfrow = c(2, 2))
+plot(solow_baseline)
+par(mfrow = c(1, 1))
+
+# Actual vs predicted for entire macro_model (for visualisation)
+macro_model$pred_solow <- predict(solow_baseline, newdata = macro_model)
+
+ggplot(macro_model, aes(x = log_gdp_pc, y = pred_solow)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(
+    x = "Actual log(GDP per capita)",
+    y = "Predicted log(GDP per capita)"
+  ) +
+  theme_minimal(base_size = 14)
+
+###############################################################################
+################# (9) PENALISED SOLOW MODELS – BASELINE FEATURES ##############
+###############################################################################
+
+x_base_train <- as.matrix(train_base %>% select(all_of(solow_vars_base)))
+y_base_train <- train_base$log_gdp_pc
+
+x_base_test  <- as.matrix(test_base %>% select(all_of(solow_vars_base)))
+y_base_test  <- test_base$log_gdp_pc
+
+# LASSO (baseline)
+lasso_base <- cv.glmnet(
+  x_base_train, y_base_train,
+  alpha = 1,
+  nfolds = 10,
+  standardize = TRUE
+)
+
+lasso_base_pred <- predict(
+  lasso_base,
+  s    = lasso_base$lambda.min,
+  newx = x_base_test
+)
+
+lasso_base_rmse <- sqrt(mean((y_base_test - lasso_base_pred)^2))
+
+# Ridge (baseline)
+ridge_base <- cv.glmnet(
+  x_base_train, y_base_train,
+  alpha = 0,
+  nfolds = 10,
+  standardize = TRUE
+)
+
+ridge_base_pred <- predict(
+  ridge_base,
+  s    = ridge_base$lambda.min,
+  newx = x_base_test
+)
+
+ridge_base_rmse <- sqrt(mean((y_base_test - ridge_base_pred)^2))
+
+###############################################################################
+################# (10) PENALISED MODELS – ENGINEERED FEATURES #################
+###############################################################################
+
+engineered_vars <- c(
+  solow_vars_base,               # baseline Solow variables
+  paste0("lag_", 1:10),          # 10 lags of log GDP per capita
+  "hc_x_tfp", "save_x_pop",      # interactions
+  "save2", "pop2", "hc2", "tfp2",# quadratic terms
+  "middle_x_tfp", "high_x_hc"    # income-group interactions
+)
+
+# Build engineered dataset WITHOUT dropping NAs yet
+model_data_eng <- macro_model %>%
+  select(log_gdp_pc, all_of(engineered_vars))
+
+set.seed(123)
+n_eng <- nrow(model_data_eng)
+train_idx_eng <- sample(seq_len(n_eng), size = round(0.7 * n_eng))
+
+train_eng <- model_data_eng[train_idx_eng, ]
+test_eng  <- model_data_eng[-train_idx_eng, ]
+
+# Drop NAs separately in train and test to avoid misalignment
+train_eng <- train_eng %>% drop_na()
+test_eng  <- test_eng %>% drop_na()
+
+x_eng_train <- as.matrix(train_eng %>% select(all_of(engineered_vars)))
+y_eng_train <- train_eng$log_gdp_pc
+
+x_eng_test  <- as.matrix(test_eng %>% select(all_of(engineered_vars)))
+y_eng_test  <- test_eng$log_gdp_pc
+
+# LASSO on engineered features
