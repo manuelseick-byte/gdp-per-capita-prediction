@@ -198,3 +198,203 @@ macro_all <- macro_all %>%
 ## 1.4 World Bank metadata: regions -------------------------------------------
 
 data("WDI_data")
+wb_countries <- WDI_data$country
+
+wb_region <- wb_countries %>%
+  select(iso3c, region) %>%
+  rename(
+    Country.Code = iso3c,
+    wb_region    = region
+  )
+
+macro_all <- macro_all %>%
+  left_join(wb_region, by = "Country.Code")
+
+# Save merged macro data (optional)
+write.csv(macro_all, "macro_all_merged.csv", row.names = FALSE)
+
+###############################################################################
+################# (2) MISSING DATA DIAGNOSTICS ################################
+###############################################################################
+
+## 2.1 Missing values per variable --------------------------------------------
+
+df <- macro_all
+
+na_summary <- df %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    cols      = everything(),
+    names_to  = "variable",
+    values_to = "na_count"
+  ) %>%
+  arrange(desc(na_count))
+
+ggplot(na_summary, aes(x = reorder(variable, na_count), y = na_count)) +
+  geom_col(fill = "#2C3E50") +
+  coord_flip() +
+  labs(
+    x = "Variable",
+    y = "Number of NA values"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10)
+  ) +
+  scale_y_continuous(labels = comma)
+
+## 2.2 Completeness across countries ------------------------------------------
+
+exclude_vars <- c("year", "wb_region", "Country.Name", "Country.Code")
+vars_to_check <- setdiff(names(df), exclude_vars)
+
+country_completeness <- df %>%
+  group_by(Country.Code, Country.Name) %>%
+  summarise(
+    n_obs        = n(),
+    completeness = 1 - mean(is.na(pick(all_of(vars_to_check)))),
+    missingness  = mean(is.na(pick(all_of(vars_to_check)))),
+    .groups      = "drop"
+  ) %>%
+  arrange(completeness)
+
+ggplot(country_completeness, aes(x = completeness)) +
+  geom_histogram(binwidth = 0.05, fill = "#2C3E50", color = "white") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = "Completeness (% of non-missing values)",
+    y = "Number of Countries"
+  ) +
+  theme_minimal(base_size = 14)
+
+## 2.3 Year-wise completeness for Solow variables -----------------------------
+
+vars_needed <- c(
+  "gdp_const_usd",
+  "population",
+  "labour_force",
+  "human_capital_index",
+  "A_t",
+  "gross_savings_current_usd",
+  "net_primary_income_current_usd"
+)
+
+availability_df <- macro_all %>%
+  mutate(across(all_of(vars_needed), ~ !is.na(.)))
+
+year_completeness <- availability_df %>%
+  reframe(
+    year         = year,
+    complete_row = rowSums(across(all_of(vars_needed))) == length(vars_needed)
+  ) %>%
+  group_by(year) %>%
+  summarise(
+    completeness_rate = mean(complete_row),
+    .groups           = "drop"
+  )
+
+ggplot(year_completeness, aes(x = year, y = completeness_rate)) +
+  geom_line(color = "#2C3E50", size = 1.3) +
+  geom_point(color = "#E74C3C", size = 2) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = "Year",
+    y = "Share of Countries with Complete Data (%)"
+  ) +
+  theme_minimal(base_size = 14)
+
+## 2.4 Aggregates vs. countries -----------------------------------------------
+
+non_country_obs <- macro_all %>%
+  filter(wb_region == "Aggregates") %>%
+  summarise(
+    number_of_observations = n(),
+    number_of_entities     = n_distinct(Country.Code)
+  )
+
+write.csv(non_country_obs, "non_country_observations.csv", row.names = FALSE)
+
+###############################################################################
+################# (3) FILTER TO COUNTRIES ONLY ################################
+###############################################################################
+
+macro_countries_only <- macro_all %>%
+  filter(wb_region != "Aggregates")
+
+write.csv(macro_countries_only, "macro_countries_only.csv", row.names = FALSE)
+
+###############################################################################
+################# (4) INCOME-GROUP CLASSIFICATION #############################
+###############################################################################
+
+# 4.1 Build base for 2023 classification --------------------------------------
+
+income_2023 <- macro_countries_only %>%
+  filter(year == 2023) %>%
+  select(Country.Code, Country.Name,
+         gni_const_usd, gdp_const_usd, population)
+
+# 4.2 Last available GNI per capita (<= 2023) ---------------------------------
+
+gni_last <- macro_countries_only %>%
+  filter(
+    year <= 2023,
+    !is.na(gni_const_usd),
+    !is.na(population),
+    population > 0
+  ) %>%
+  arrange(Country.Code, year) %>%
+  group_by(Country.Code, Country.Name) %>%
+  filter(year == max(year)) %>%
+  ungroup() %>%
+  mutate(
+    gni_pc_last   = gni_const_usd / population,
+    year_last_gni = year
+  ) %>%
+  select(Country.Code, Country.Name, gni_pc_last, year_last_gni)
+
+income_base <- income_2023 %>%
+  left_join(gni_last, by = c("Country.Code", "Country.Name"))
+
+# 4.3 Per-capita income with priority rule ------------------------------------
+
+income_base <- income_base %>%
+  mutate(
+    gni_pc_2023 = ifelse(
+      !is.na(gni_const_usd) & !is.na(population) & population > 0,
+      gni_const_usd / population,
+      NA_real_
+    ),
+    gdp_pc_2023 = ifelse(
+      !is.na(gdp_const_usd) & !is.na(population) & population > 0,
+      gdp_const_usd / population,
+      NA_real_
+    ),
+    income_pc_for_class = case_when(
+      !is.na(gni_pc_2023) ~ gni_pc_2023,
+      is.na(gni_pc_2023) & !is.na(gdp_pc_2023) ~ gdp_pc_2023,
+      is.na(gni_pc_2023) & is.na(gdp_pc_2023) & !is.na(gni_pc_last) ~ gni_pc_last,
+      TRUE ~ 0
+    )
+  )
+
+# 4.4 Apply thresholds: 4-group and 3-group -----------------------------------
+
+income_base <- income_base %>%
+  mutate(
+    income_group_4 = case_when(
+      income_pc_for_class <= 1035 ~ "Low income",
+      income_pc_for_class >= 1036 & income_pc_for_class <= 4085 ~ "Lower-middle income",
+      income_pc_for_class >= 4086 & income_pc_for_class <= 12615 ~ "Upper-middle income",
+      income_pc_for_class > 12615 ~ "High income",
+      TRUE ~ "Low income"
+    ),
+    income_group_3 = case_when(
+      income_pc_for_class <= 1035 ~ "Low income",
+      income_pc_for_class > 12615 ~ "High income",
+      income_pc_for_class > 1035 & income_pc_for_class <= 12615 ~ "Middle income",
+      TRUE ~ "Low income"
+    )
+  )
+
