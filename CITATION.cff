@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use or refer to this repository, please cite the project."
+title: "Predicting GDP per Capita Across Income Groups"
+type: software
+authors:
+  - family-names: Seick
+    given-names: Manuel
+date-released: 2025
+repository-code: "https://github.com/manuelseick-byte/gdp-per-capita-prediction"
