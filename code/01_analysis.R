@@ -998,3 +998,18 @@ ggplot(importance_melted,
   geom_col(position = position_dodge(width = 0.75)) +
   coord_flip() +
   scale_fill_manual(values = model_colors) +
+  labs(
+    x = "Variable",
+    y = "Normalised Importance",
+    fill = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    legend.title = element_text(size = 13),
+    legend.text  = element_text(size = 11)
+  )
+
+########################### END SCRIPT #######################################
