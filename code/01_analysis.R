@@ -798,3 +798,203 @@ x_eng_test  <- as.matrix(test_eng %>% select(all_of(engineered_vars)))
 y_eng_test  <- test_eng$log_gdp_pc
 
 # LASSO on engineered features
+lasso_eng <- cv.glmnet(
+  x_eng_train, y_eng_train,
+  alpha = 1,
+  nfolds = 10,
+  standardize = TRUE
+)
+
+lasso_eng_pred  <- predict(lasso_eng, s = lasso_eng$lambda.min, newx = x_eng_test)
+lasso_eng_rmse  <- sqrt(mean((y_eng_test - lasso_eng_pred)^2))
+
+# Ridge on engineered features
+ridge_eng <- cv.glmnet(
+  x_eng_train, y_eng_train,
+  alpha = 0,
+  nfolds = 10,
+  standardize = TRUE
+)
+
+ridge_eng_pred <- predict(ridge_eng, s = ridge_eng$lambda.min, newx = x_eng_test)
+ridge_eng_rmse <- sqrt(mean((y_eng_test - ridge_eng_pred)^2))
+
+###############################################################################
+################# (11) NON-LINEAR MODELS: RF & kNN (BASELINE) #################
+###############################################################################
+
+# We reuse train_base / test_base
+x_train <- as.matrix(train_base %>% select(all_of(solow_vars_base)))
+y_train <- train_base$log_gdp_pc
+
+x_test  <- as.matrix(test_base %>% select(all_of(solow_vars_base)))
+y_test  <- test_base$log_gdp_pc
+
+# Random Forest
+rf_model <- randomForest(
+  x = x_train,
+  y = y_train,
+  ntree = 500,
+  mtry = floor(sqrt(ncol(x_train))),
+  importance = TRUE
+)
+
+rf_pred <- predict(rf_model, newdata = x_test)
+rf_rmse <- sqrt(mean((y_test - rf_pred)^2))
+
+varImpPlot(rf_model, main = "Random Forest Variable Importance")
+
+# kNN (with scaling)
+x_train_scaled <- scale(x_train)
+train_mean <- attr(x_train_scaled, "scaled:center")
+train_sd   <- attr(x_train_scaled, "scaled:scale")
+x_test_scaled <- scale(x_test, center = train_mean, scale = train_sd)
+
+k_values <- c(3, 5, 10, 20)
+knn_rmse <- numeric(length(k_values))
+
+for (i in seq_along(k_values)) {
+  k <- k_values[i]
+  knn_pred <- knn.reg(
+    train = x_train_scaled,
+    test  = x_test_scaled,
+    y     = y_train,
+    k     = k
+  )$pred
+  
+  knn_rmse[i] <- sqrt(mean((y_test - knn_pred)^2))
+}
+
+knn_results <- data.frame(k = k_values, RMSE = knn_rmse)
+best_k <- k_values[which.min(knn_rmse)]
+min(knn_rmse)
+
+###############################################################################
+################# (12) MODEL COMPARISON TABLE #################################
+###############################################################################
+
+# Compile RMSE results
+results <- data.frame(
+  Model = c(
+    "OLS (baseline)",
+    "LASSO (baseline features)",
+    "Ridge (baseline features)",
+    "LASSO (engineered features)",
+    "Ridge (engineered features)",
+    "Random Forest (baseline features)",
+    "kNN (baseline features, best k)"
+  ),
+  RMSE = c(
+    rmse_ols,          # OLS test RMSE
+    lasso_base_rmse,
+    ridge_base_rmse,
+    lasso_eng_rmse,
+    ridge_eng_rmse,
+    rf_rmse,
+    min(knn_rmse)
+  )
+)
+
+results
+
+###############################################################################
+################# (13) VARIABLE IMPORTANCE ACROSS MODELS ######################
+###############################################################################
+
+# Ridge importance (baseline features)
+ridge_coef <- as.matrix(coef(ridge_base, s = ridge_base$lambda.min))[-1, ]
+ridge_importance <- data.frame(
+  variable         = solow_vars_base,
+  importance_ridge = abs(ridge_coef)
+)
+
+# LASSO importance (baseline features)
+lasso_coef <- as.matrix(coef(lasso_base, s = lasso_base$lambda.min))[-1, ]
+lasso_importance <- data.frame(
+  variable         = solow_vars_base,
+  importance_lasso = abs(lasso_coef)
+)
+
+# Random Forest importance (baseline features)
+rf_imp <- importance(rf_model, type = 1)
+rf_importance <- data.frame(
+  variable      = rownames(rf_imp),
+  importance_rf = rf_imp[, 1]
+)
+
+# kNN permutation importance (baseline features)
+knn_importance <- data.frame(
+  variable        = solow_vars_base,
+  importance_knn  = NA_real_
+)
+
+for (v in solow_vars_base) {
+  x_test_permuted <- x_test_scaled
+  col_idx <- which(colnames(x_test_permuted) == v)
+  x_test_permuted[, col_idx] <- sample(x_test_permuted[, col_idx])
+  
+  perm_pred <- knn.reg(
+    train = x_train_scaled,
+    test  = x_test_permuted,
+    y     = y_train,
+    k     = best_k
+  )$pred
+  
+  perm_rmse <- sqrt(mean((y_test - perm_pred)^2))
+  knn_importance$importance_knn[knn_importance$variable == v] <-
+    perm_rmse - min(knn_rmse)
+}
+
+importance_all <- ridge_importance %>%
+  left_join(lasso_importance, by = "variable") %>%
+  left_join(rf_importance,   by = "variable") %>%
+  left_join(knn_importance,  by = "variable")
+
+importance_norm <- importance_all
+importance_norm[, -1] <- apply(importance_norm[, -1], 2, function(x) {
+  if (max(x) == min(x)) {
+    0
+  } else {
+    (x - min(x)) / (max(x) - min(x))
+  }
+})
+
+importance_norm
+
+###############################################################################
+################# (14) VARIABLE IMPORTANCE PLOTTING ###########################
+###############################################################################
+
+importance_melted <- importance_norm %>%
+  pivot_longer(
+    cols = -variable,
+    names_to  = "model",
+    values_to = "importance"
+  ) %>%
+  mutate(
+    model = dplyr::recode(
+      model,
+      importance_lasso = "LASSO",
+      importance_ridge = "Ridge",
+      importance_rf    = "Random Forest",
+      importance_knn   = "kNN"
+    ),
+    model = factor(model,
+                   levels = c("LASSO", "Ridge", "Random Forest", "kNN"))
+  )
+
+# Consistent colour palette
+model_colors <- c(
+  "LASSO"         = "#4E79A7",  # blue
+  "Ridge"         = "#F28E2B",  # orange
+  "Random Forest" = "#E15759",  # red
+  "kNN"           = "#76B7B2"   # teal
+)
+
+ggplot(importance_melted,
+       aes(x = reorder(variable, importance),
+           y = importance,
+           fill = model)) +
+  geom_col(position = position_dodge(width = 0.75)) +
+  coord_flip() +
+  scale_fill_manual(values = model_colors) +
